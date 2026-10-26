@@ -1,0 +1,42 @@
+name: Bevaka MATCHi
+
+on:
+  schedule:
+    - cron: "*/5 6-22 * * *"   # var 5:e min, ca 07–23 svensk tid
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+concurrency:
+  group: bevaka-matchi
+  cancel-in-progress: false
+
+jobs:
+  bevaka:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - run: pip install -r requirements.txt
+
+      - name: Kolla lediga tider
+        env:
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+          MATCHI_COOKIE: ${{ secrets.MATCHI_COOKIE }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python matchi_bevakare.py
+
+      - name: Spara kända tider
+        run: |
+          git config user.name "matchi-bevakare"
+          git config user.email "actions@users.noreply.github.com"
+          git add state.json
+          git diff --cached --quiet || (git commit -m "Uppdatera state" -q && git push -q)
