@@ -235,6 +235,40 @@ def parsa_slots(html: str, hallnamn: str, slug: str) -> List[Slot]:
     return resultat
 
 
+# Tider som syns som lediga men är reserverade för en kravprofil (t.ex. en
+# stege) och släpps till alla senare. Syns bara när man öppnar bokningen.
+SPARR_RE = re.compile(r"kravprofil|reserverad för kunder|reserved for customers", re.I)
+SLAPP_RE = re.compile(r"(?:från|from)\s+(\d{1,2})\s+([a-zåäö]+)\s+(\d{1,2}):(\d{2})", re.I)
+
+
+def tolka_slapptid(text: str, slot: Slot) -> str:
+    """'... tillgänglig för alla kunder från 07 november 20:00' -> ISO-tid, '' om okänd."""
+    m = SLAPP_RE.search(text)
+    if not m:
+        return ""
+    manad = m.group(2).lower()[:3]
+    if manad not in MANADER:
+        return ""
+    ar = slot.start_dt.year
+    t = datetime(ar, MANADER.index(manad), int(m.group(1)), int(m.group(3)), int(m.group(4)), tzinfo=TZ)
+    if t > slot.start_dt:  # t.ex. släpps i december för en tid i januari
+        t = t.replace(year=ar - 1)
+    return t.isoformat()
+
+
+def kolla_sparr(sess: requests.Session, slot: Slot) -> Optional[str]:
+    """Öppnar bokningen (kräver inloggning). None = går att boka,
+    annars ISO-tid då spärren släpps ('' om okänt)."""
+    r = sess.get(slot.boka_url, timeout=20)
+    r.raise_for_status()
+    if "/login" in r.url:  # utloggad – kan inte avgöra
+        return None
+    text = " ".join(BeautifulSoup(r.text, "html.parser").get_text().split())
+    if not SPARR_RE.search(text):
+        return None
+    return tolka_slapptid(text, slot)
+
+
 def ny_session() -> requests.Session:
     s = requests.Session()
     s.headers.update(HEADERS)
@@ -387,11 +421,21 @@ def las_state(p: Path) -> Optional[dict]:
         return None
 
 
-def spara_state(p: Path, tider: Dict[str, Slot], varnade_hallar: List[str]) -> None:
+def spara_state(
+    p: Path,
+    tider: Dict[str, Slot],
+    varnade_hallar: List[str],
+    sparrade: Optional[Dict[str, str]] = None,
+    bokningsbara: Optional[set] = None,
+) -> None:
     data = {
         "uppdaterad": datetime.now(TZ).isoformat(timespec="seconds"),
         "inloggning_varnad": sorted(varnade_hallar),
         "tider": {k: asdict(v) for k, v in sorted(tider.items(), key=lambda kv: kv[1].start)},
+        # id -> när spärren släpps ('' = okänt, kolla igen varje körning)
+        "sparrade": dict(sorted((sparrade or {}).items())),
+        # redan kontrollerade som bokningsbara, behöver inte öppnas igen
+        "bokningsbara": sorted(bokningsbara or ()),
     }
     p.write_text(json.dumps(data, ensure_ascii=False, indent=1), encoding="utf-8")
 
@@ -419,14 +463,48 @@ def kor_en_gang(cfg: dict, state_path: Path, visa: bool = False) -> None:
             if not filter_ or any(f.matchar(t) for f in filter_):
                 aktuella[t.id] = t
 
-    if visa:
-        logg(f"{len(aktuella)} lediga tider matchar dina filter just nu:")
-        print(formatera(list(aktuella.values()), max_rader=500) or "(inga)")
-        return
-
     state = las_state(state_path)
     forsta = state is None
     tidigare: Dict[str, Slot] = {k: Slot(**v) for k, v in (state or {}).get("tider", {}).items()}
+
+    # Sortera bort tider som är reserverade för en kravprofil. De räknas som nya
+    # (och ger notis) först när de går att boka. Kräver inloggning.
+    sparrade: Dict[str, str] = {}
+    sparrade_slots: Dict[str, Slot] = {}
+    bokningsbara: set = set()
+    if "Cookie" in sess.headers:
+        kanda_ok = set((state or {}).get("bokningsbara", []))
+        sparrade_fore: Dict[str, str] = (state or {}).get("sparrade", {})
+        for k, t in list(aktuella.items()):
+            if k in kanda_ok:
+                bokningsbara.add(k)
+                continue
+            slapps = sparrade_fore.get(k)
+            if slapps and datetime.fromisoformat(slapps) > nu:
+                sparr: Optional[str] = slapps  # inte släppt än, ingen idé att kolla
+            else:
+                try:
+                    sparr = kolla_sparr(sess, t)
+                except Exception as e:
+                    logg(f"{t.hall} {t.start}: kunde inte öppna bokningen ({e})")
+                    sparr = slapps  # tidigare spärrad förblir spärrad, annars räknas den som ledig
+                time.sleep(paus + random.uniform(0, paus))
+            if sparr is None:
+                bokningsbara.add(k)
+            else:
+                sparrade[k] = sparr
+                sparrade_slots[k] = aktuella.pop(k)
+
+    if visa:
+        logg(f"{len(aktuella)} lediga tider matchar dina filter just nu:")
+        print(formatera(list(aktuella.values()), max_rader=500) or "(inga)")
+        if sparrade_slots:
+            print(f"\n{len(sparrade_slots)} reserverade för kravprofil (notis när de släpps):")
+            for k, t in sorted(sparrade_slots.items(), key=lambda kv: kv[1].start):
+                s = sparrade[k]
+                nar = f"{datetime.fromisoformat(s):%d/%m %H:%M}" if s else "okänt"
+                print(f"{formatera([t])} · släpps {nar}")
+        return
 
     # Datum som inte gick att hämta: behåll tidigare kända tider så att de inte
     # felaktigt "försvinner" och sedan larmar som nya nästa gång.
@@ -435,7 +513,7 @@ def kor_en_gang(cfg: dict, state_path: Path, visa: bool = False) -> None:
             aktuella.setdefault(k, t)
 
     nya = [t for k, t in aktuella.items() if k not in tidigare]
-    spara_state(state_path, aktuella, begransade)
+    spara_state(state_path, aktuella, begransade, sparrade, bokningsbara)
 
     # Säg till EN gång när medlemsfönstret slutar synas (oftast utgången cookie)
     redan_varnade = set((state or {}).get("inloggning_varnad", []))
