@@ -51,4 +51,4 @@ dagar_fram = 21
 namn = "Vardagskvällar"
 dagar = "mån-tor"
 start_tidigast = "18:00"
-start_senast = "22:00"
+start_senast = "21:00"
